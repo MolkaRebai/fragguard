@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+fragguard.log
+test_capture.pcap
+*.egg-info/
+.venv/
+venv/

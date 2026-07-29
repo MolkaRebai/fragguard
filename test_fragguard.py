@@ -106,6 +106,65 @@ def test_different_sources_are_tracked_independently():
     assert alerts_for(guard, innocent) == 0
 
 
+def test_identical_retransmission_is_not_flagged_as_overlap():
+    """A retransmission with IDENTICAL bytes at an overlapping offset is
+    harmless (e.g. a resend after a delayed ACK) and should NOT be flagged -
+    only a genuine content CONFLICT in the overlap region is a real attack."""
+    guard = make_guard()
+    src = "10.0.0.30"
+    payload = b"A" * 64
+    frag1 = IP(src=src, dst="10.0.0.100", id=30, flags="MF", frag=0) / Raw(load=payload)
+    # Same IP id, overlapping offset, but IDENTICAL bytes in the overlap region
+    frag2 = IP(src=src, dst="10.0.0.100", id=30, flags=0, frag=4) / Raw(load=payload[32:] + b"C" * 32)
+
+    guard.handle_packet(frag1)
+    guard.handle_packet(frag2)
+
+    assert alerts_for(guard, src) == 0, "identical overlapping data should not be flagged"
+
+
+def test_conflicting_retransmission_is_still_flagged_as_overlap():
+    """Sanity check that genuinely conflicting data at an overlapping offset
+    is still caught after the content-comparison change."""
+    guard = make_guard()
+    src = "10.0.0.31"
+    frag1 = IP(src=src, dst="10.0.0.100", id=31, flags="MF", frag=0) / Raw(load=b"A" * 64)
+    frag2 = IP(src=src, dst="10.0.0.100", id=31, flags=0, frag=4) / Raw(load=b"Z" * 64)  # conflicting bytes
+
+    guard.handle_packet(frag1)
+    guard.handle_packet(frag2)
+
+    assert alerts_for(guard, src) >= 1
+
+
+def test_whitelisted_source_is_never_flagged():
+    guard = FragGuard(block=False, whitelist=["10.0.0.50/32"])
+    src = "10.0.0.50"
+    tiny_frag = IP(src=src, dst="10.0.0.100", id=50, flags="MF", frag=0) / Raw(load=b"A" * 8)
+
+    guard.handle_packet(tiny_frag)
+
+    assert alerts_for(guard, src) == 0
+
+
+def test_tiny_fragment_repeat_threshold_reduces_false_positives():
+    """With the repeat threshold raised, a single tiny fragment should NOT
+    alert, but repeated occurrences from the same source still should."""
+    guard = FragGuard(block=False, tiny_repeat_threshold=3)
+    src = "10.0.0.40"
+
+    frag_a = IP(src=src, dst="10.0.0.100", id=40, flags="MF", frag=0) / Raw(load=b"A" * 8)
+    guard.handle_packet(frag_a)
+    assert alerts_for(guard, src) == 0, "one tiny fragment shouldn't alert when threshold is 3"
+
+    frag_b = IP(src=src, dst="10.0.0.100", id=41, flags="MF", frag=0) / Raw(load=b"A" * 8)
+    frag_c = IP(src=src, dst="10.0.0.100", id=42, flags="MF", frag=0) / Raw(load=b"A" * 8)
+    guard.handle_packet(frag_b)
+    guard.handle_packet(frag_c)
+
+    assert alerts_for(guard, src) >= 1, "third tiny fragment should cross the threshold"
+
+
 if __name__ == "__main__":
     import sys
     import pytest

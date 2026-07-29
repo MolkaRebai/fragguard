@@ -36,6 +36,7 @@ Usage:
 """
 
 import argparse
+import ipaddress
 import logging
 import subprocess
 import sys
@@ -54,7 +55,18 @@ except ImportError:
 
 TINY_FRAGMENT_MIN_BYTES = 64      # first-fragment payload smaller than this
                                    # is considered "too small to be legit"
+TINY_FRAGMENT_WINDOW_SEC = 30     # sliding window for repeat tiny-fragment check
+TINY_FRAGMENT_REPEAT_THRESHOLD = 1  # how many tiny fragments from one source
+                                   # within the window before alerting. Default
+                                   # of 1 alerts immediately (max sensitivity);
+                                   # raise to 2-3 on networks with legitimate
+                                   # small-MTU tunnels/VPNs to cut false positives
 MAX_IP_PACKET_SIZE = 65535        # legal upper bound for a reassembled datagram
+
+# CIDR ranges or exact IPs to skip entirely - e.g. a known VPN concentrator or
+# NAT gateway that legitimately produces unusual fragment patterns. Populate
+# via --whitelist on the command line (comma-separated), or edit this default.
+DEFAULT_WHITELIST = []
 
 SESSION_TIMEOUT_SEC = 15          # how long we wait for a fragment group to
                                    # complete before calling it "stale"
@@ -83,34 +95,48 @@ log = logging.getLogger("fragguard")
 
 
 class FragmentSession:
-    """Tracks all fragments seen for a given (src, dst, ip_id) group."""
+    """Tracks all fragments seen for a given (src, dst, ip_id) group.
+
+    Overlap detection compares actual byte content in the overlapping region,
+    not just whether the ranges intersect. Two fragments can legitimately
+    overlap if a sender retransmits the exact same bytes at the same offset
+    (harmless duplication) - only a genuine CONFLICT (different data claimed
+    for the same byte range) is a real Teardrop-style attack signal. This
+    materially cuts false positives from retransmissions.
+    """
 
     def __init__(self, src, dst, ip_id, proto):
         self.src = src
         self.dst = dst
         self.ip_id = ip_id
         self.proto = proto
-        self.ranges = []          # list of (start_byte, end_byte) already seen
+        self.segments = []        # list of (start_byte, end_byte, payload_bytes)
         self.first_seen = time.time()
         self.last_seen = time.time()
         self.completed = False    # True once a fragment with MF=0 arrives
         self.max_end = 0          # highest byte offset implied so far
 
-    def add_fragment(self, offset_bytes, length, more_fragments):
+    def add_fragment(self, offset_bytes, payload, more_fragments):
         self.last_seen = time.time()
         start = offset_bytes
-        end = offset_bytes + length
-        overlap = self._check_overlap(start, end)
-        self.ranges.append((start, end))
+        end = offset_bytes + len(payload)
+        conflict = self._check_overlap_conflict(start, end, payload)
+        self.segments.append((start, end, payload))
         self.max_end = max(self.max_end, end)
         if not more_fragments:
             self.completed = True
-        return overlap
+        return conflict
 
-    def _check_overlap(self, start, end):
-        for (s, e) in self.ranges:
+    def _check_overlap_conflict(self, start, end, payload):
+        for (s, e, old_payload) in self.segments:
             if start < e and end > s:   # ranges intersect
-                return True
+                ov_start, ov_end = max(start, s), min(end, e)
+                new_slice = payload[ov_start - start: ov_end - start]
+                old_slice = old_payload[ov_start - s: ov_end - s]
+                if new_slice != old_slice:
+                    return True   # genuine conflicting data - real attack signal
+                # else: identical bytes in the overlap - harmless retransmission,
+                # keep checking other segments rather than returning early
         return False
 
 
@@ -120,6 +146,7 @@ class SourceTracker:
     def __init__(self):
         self.fragment_times = deque()   # timestamps of fragments received
         self.stale_times = deque()      # timestamps of sessions gone stale
+        self.tiny_times = deque()       # timestamps of tiny first-fragments seen
         self.alert_count = 0
         self.blocked = False
 
@@ -138,15 +165,35 @@ class SourceTracker:
         self._trim(self.stale_times, FLOOD_WINDOW_SEC)
         return len(self.stale_times)
 
+    def record_tiny(self):
+        self.tiny_times.append(time.time())
+        self._trim(self.tiny_times, TINY_FRAGMENT_WINDOW_SEC)
+        return len(self.tiny_times)
+
 
 class FragGuard:
-    def __init__(self, block=False, tiny_min=TINY_FRAGMENT_MIN_BYTES):
+    def __init__(self, block=False, tiny_min=TINY_FRAGMENT_MIN_BYTES,
+                 whitelist=None, tiny_repeat_threshold=TINY_FRAGMENT_REPEAT_THRESHOLD):
         self.block = block
         self.tiny_min = tiny_min
+        self.tiny_repeat_threshold = tiny_repeat_threshold
         self.sessions = {}                          # key -> FragmentSession
         self.sources = defaultdict(SourceTracker)    # src_ip -> SourceTracker
         self.blocked_ips = set()
         self.last_gc = time.time()
+        self.whitelist = []
+        for entry in (whitelist or DEFAULT_WHITELIST):
+            try:
+                self.whitelist.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                log.error(f"Ignoring invalid whitelist entry: {entry!r}")
+
+    def _is_whitelisted(self, ip_str):
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        return any(addr in net for net in self.whitelist)
 
     # ---------------------- core packet handling ----------------------
 
@@ -165,20 +212,31 @@ class FragGuard:
             return  # ordinary, non-fragmented packet - nothing to do
 
         src, dst = ip.src, ip.dst
-        payload_len = len(ip.payload)  # bytes carried in this fragment
+        if self._is_whitelisted(src):
+            return  # trusted source (e.g. known VPN gateway) - skip entirely
+
+        payload = bytes(ip.payload)     # actual bytes carried in this fragment
+        payload_len = len(payload)
         key = (src, dst, ip.id)
 
         tracker = self.sources[src]
         count_in_window = tracker.record_fragment()
 
         # ---- Rule 1: Tiny Fragment Attack ----
+        # Requires TINY_FRAGMENT_REPEAT_THRESHOLD occurrences within the window
+        # before alerting (default 1 = alert immediately). Raising this cuts
+        # false positives on networks with legitimate small-MTU tunnels/VPNs,
+        # since a single odd fragment is far less suspicious than a pattern.
         if offset_bytes == 0 and more_fragments and payload_len < self.tiny_min:
-            self._alert(
-                src, dst,
-                f"Tiny fragment attack: first fragment only {payload_len} "
-                f"bytes (< {self.tiny_min}), IP id={ip.id}. Likely firewall/"
-                f"IDS evasion attempt."
-            )
+            tiny_count = tracker.record_tiny()
+            if tiny_count >= self.tiny_repeat_threshold:
+                self._alert(
+                    src, dst,
+                    f"Tiny fragment attack: first fragment only {payload_len} "
+                    f"bytes (< {self.tiny_min}), IP id={ip.id}, seen {tiny_count}x "
+                    f"in {TINY_FRAGMENT_WINDOW_SEC}s. Likely firewall/IDS evasion "
+                    f"attempt."
+                )
 
         # ---- Rule 3: Oversized reassembly / Ping-of-Death ----
         implied_end = offset_bytes + payload_len
@@ -191,18 +249,21 @@ class FragGuard:
             )
 
         # ---- Session tracking + Rule 2: Overlapping fragments ----
+        # Only alerts on a genuine content CONFLICT in the overlapping bytes -
+        # an identical retransmission at the same offset is not flagged, since
+        # that's harmless and common on real (if unusual) network paths.
         session = self.sessions.get(key)
         if session is None:
             session = FragmentSession(src, dst, ip.id, ip.proto)
             self.sessions[key] = session
 
-        overlap = session.add_fragment(offset_bytes, payload_len, more_fragments)
-        if overlap:
+        conflict = session.add_fragment(offset_bytes, payload, more_fragments)
+        if conflict:
             self._alert(
                 src, dst,
                 f"Overlapping fragment attack (Teardrop-style): fragment "
                 f"[{offset_bytes}:{offset_bytes+payload_len}] overlaps a "
-                f"previously seen range for IP id={ip.id}."
+                f"previously seen range with CONFLICTING data for IP id={ip.id}."
             )
 
         if session.completed:
@@ -301,12 +362,27 @@ def main():
         "--tiny-min", type=int, default=TINY_FRAGMENT_MIN_BYTES,
         help=f"Byte threshold for tiny-fragment detection (default {TINY_FRAGMENT_MIN_BYTES})"
     )
+    parser.add_argument(
+        "--tiny-repeat", type=int, default=TINY_FRAGMENT_REPEAT_THRESHOLD,
+        help=f"How many tiny fragments from one source before alerting "
+             f"(default {TINY_FRAGMENT_REPEAT_THRESHOLD}). Raise on networks with "
+             f"legitimate small-MTU tunnels to reduce false positives."
+    )
+    parser.add_argument(
+        "--whitelist", default="",
+        help="Comma-separated list of trusted IPs/CIDR ranges to skip entirely, "
+             "e.g. --whitelist 10.0.0.1,192.168.1.0/24"
+    )
     args = parser.parse_args()
 
     if not args.iface and not args.pcap:
         parser.error("Provide either --iface (live capture) or --pcap (offline analysis)")
 
-    guard = FragGuard(block=args.block, tiny_min=args.tiny_min)
+    whitelist = [w.strip() for w in args.whitelist.split(",") if w.strip()]
+    guard = FragGuard(
+        block=args.block, tiny_min=args.tiny_min,
+        whitelist=whitelist, tiny_repeat_threshold=args.tiny_repeat,
+    )
 
     mode = "BLOCKING ENABLED" if args.block else "DRY-RUN (log only)"
     log.info(f"FragGuard starting - mode: {mode}")

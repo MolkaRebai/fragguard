@@ -44,10 +44,43 @@ Tune the tiny-fragment threshold:
 sudo python3 fragguard.py --iface eth0 --tiny-min 40
 ```
 
+Reduce false positives from odd-but-legitimate small-MTU tunnels/VPNs by requiring
+a repeated pattern before alerting on tiny fragments (default is 1 = alert
+immediately):
+```bash
+sudo python3 fragguard.py --iface eth0 --tiny-repeat 3
+```
+
+Exclude trusted sources entirely (e.g. a known VPN gateway or NAT device that
+legitimately produces unusual fragment patterns) with a comma-separated allowlist
+of IPs/CIDR ranges:
+```bash
+sudo python3 fragguard.py --iface eth0 --whitelist 10.0.0.1,192.168.1.0/24
+```
+
 Other thresholds (flood window, flood count, session timeout) are constants near the
 top of `fragguard.py` — tune them there for your environment/write-up.
 
 Find your interface name with `ip link` (Linux) or `ifconfig`.
+
+## Accuracy: telling real attacks from lost, delayed, or reordered packets
+
+Overlap and oversized-reassembly checks are structural impossibilities — no amount
+of packet loss, delay, or reordering on a real network can make two honest
+fragments claim conflicting data at the same byte offset, or make a legitimately
+fragmented packet exceed the legal 65,535-byte limit. These fire on a single
+occurrence because there's nothing ambiguous about them. The overlap check
+specifically compares the actual bytes in the overlapping region rather than just
+whether the byte ranges touch — an identical retransmission (same data resent
+at the same offset, which is normal on a lossy link) is **not** flagged; only a
+genuine content conflict is.
+
+Tiny-fragment and flood/stale-session checks are statistical, and worth tuning
+against your own network's baseline. `--tiny-repeat` and `STALE_SESSION_THRESHOLD`
+both require a *pattern* across multiple occurrences from the same source before
+alerting, rather than treating one odd fragment or one slow session as proof of
+an attack. `--whitelist` lets you exclude a known unusual source entirely instead
+of fighting its false positives with thresholds alone.
 
 ## Testing it
 
@@ -87,15 +120,15 @@ fragguard/
   packet and applies all the rules; `_garbage_collect()` periodically expires
   fragment groups that never completed; `_block_ip()` wraps the `iptables` call.
 
-## Ideas for extending it (good next steps for a project write-up)
+## Ideas for extending it further (good next steps for a project write-up)
 
 - Add IPv6 extension-header fragmentation detection (`IPv6ExtHdrFragment` in Scapy).
 - Persist alerts to SQLite instead of a flat log file, and build a small dashboard.
 - Time-limited / auto-expiring blocks instead of permanent `iptables` rules.
-- Whitelist/allowlist trusted CIDR ranges so you never block your own gateway.
-- Swap the `iptables` backend for `nftables` for a more modern Linux setup.
-- Add unit tests that feed crafted Scapy packets straight into `handle_packet()`
-  (no real network needed) to verify each rule deterministically.
+- Swap the `iptables` backend for `nftables`, or add a Windows Firewall
+  (`netsh advfirewall`) backend for cross-platform blocking.
+- Add a source-reputation score that combines multiple alert types over time,
+  rather than treating each rule's alert count independently.
 
 ## Ethics / scope
 

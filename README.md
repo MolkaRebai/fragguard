@@ -1,3 +1,5 @@
+![Tests](https://github.com/MolkaRebai/fragguard/actions/workflows/tests.yml/badge.svg)
+
 # FragGuard — IP Fragmentation Attack Detector & Blocker
 
 A learning project that sniffs live traffic (or reads a pcap) and detects common
